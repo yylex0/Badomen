@@ -3,7 +3,7 @@
 
 Katana is used for broad URL discovery when available. Every discovered URL is
 then independently fetched and verified by the HTTP evidence engine in
-``webrecon.py``. Only observed HTML pages are included in the final inventory.
+an internal HTTP evidence engine. Only observed HTML pages are included in the final inventory.
 
 The four public labels describe observable delivery behavior, not private
 server implementation details. A black-box scanner cannot prove with absolute
@@ -30,13 +30,473 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qsl, urlsplit
 
-from webrecon import (
-    HTML_CONTENT_TYPES,
-    PageResult,
-    ScannerConfig,
-    WebReconScanner,
-    escape,
+from html import escape as _html_escape
+from html.parser import HTMLParser
+from urllib.error import HTTPError, URLError
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
 )
+import ssl
+import threading
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
+
+HTML_CONTENT_TYPES = {
+    "text/html",
+    "application/xhtml+xml",
+}
+
+
+def escape(value: object) -> str:
+    return _html_escape(str(value), quote=True)
+
+
+@dataclass(frozen=True)
+class ScannerConfig:
+    seed_url: str
+    output: Path
+    max_depth: int = 5
+    max_pages: int = 2000
+    concurrency: int = 2
+    timeout: float = 10.0
+    request_delay: float = 0.1
+    max_response_bytes: int = 2_000_000
+    max_script_bytes: int = 250_000
+    max_scripts: int = 25
+    excluded_paths: tuple[str, ...] = ()
+    discover_sitemaps: bool = True
+    allow_invalid_tls: bool = True
+    user_agent: str = "badomen/1.0.0 (authorized page inventory classifier)"
+
+
+@dataclass
+class ScanStats:
+    started_at: str | None = None
+    finished_at: str | None = None
+    scripts_checked: int = 0
+    sitemap_pages_discovered: int = 0
+    skipped_out_of_scope: int = 0
+    skipped_excluded: int = 0
+    skipped_risky: int = 0
+    skipped_depth: int = 0
+    skipped_query_cap: int = 0
+
+
+@dataclass
+class PageResult:
+    url: str
+    final_url: str
+    depth: int
+    discovered_by: str
+    referrer: str | None
+    status: int
+    content_type: str
+    classification: str
+    confidence: str
+    reason_codes: list[str]
+    limitations: list[str]
+    links: list[str]
+    redirect_count: int
+    content_fingerprint: str
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def http_error_301(self, req, fp, code, msg, headers):
+        return fp
+    def http_error_302(self, req, fp, code, msg, headers):
+        return fp
+    def http_error_303(self, req, fp, code, msg, headers):
+        return fp
+    def http_error_307(self, req, fp, code, msg, headers):
+        return fp
+    def http_error_308(self, req, fp, code, msg, headers):
+        return fp
+
+
+class _PageParser(HTMLParser):
+    def __init__(self, base_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.links: list[str] = []
+        self.scripts: list[str] = []
+        self.inline_scripts: list[str] = []
+        self.forms = 0
+        self.post_forms = 0
+        self.submit_controls = 0
+        self.password_inputs = 0
+        self.text_chunks: list[str] = []
+        self.hydration = False
+        self._in_script = False
+        self._script_external = False
+        self._script_buf: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs):
+        attrs_dict = {k.lower(): v for k, v in attrs if k}
+        tag_l = tag.lower()
+        if tag_l in {"a", "area", "link"} and attrs_dict.get("href"):
+            self._add_link(attrs_dict["href"])
+        elif tag_l in {"iframe", "frame", "object"} and attrs_dict.get("src"):
+            self._add_link(attrs_dict["src"])
+        if tag_l == "form":
+            self.forms += 1
+            if (attrs_dict.get("method") or "get").lower() == "post":
+                self.post_forms += 1
+        if tag_l in {"input", "button"} and (attrs_dict.get("type") or "").lower() in {"submit", "button", "image"}:
+            self.submit_controls += 1
+        if tag_l == "input" and (attrs_dict.get("type") or "").lower() == "password":
+            self.password_inputs += 1
+        if any(k.startswith("data-react") for k in attrs_dict) or "data-reactroot" in attrs_dict:
+            self.hydration = True
+        if "data-nextjs" in attrs_dict or "data-n-head" in attrs_dict:
+            self.hydration = True
+        if tag_l == "script":
+            src = attrs_dict.get("src")
+            self._in_script = True
+            self._script_external = bool(src)
+            self._script_buf = []
+            if src:
+                self._add_script(src)
+
+    def handle_startendtag(self, tag: str, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag.lower() == "script":
+            self.handle_endtag("script")
+
+    def handle_endtag(self, tag: str):
+        if tag.lower() == "script" and self._in_script:
+            text = "".join(self._script_buf)
+            if text.strip():
+                self.inline_scripts.append(text)
+            self._in_script = False
+            self._script_external = False
+            self._script_buf = []
+
+    def handle_data(self, data: str):
+        if self._in_script:
+            self._script_buf.append(data)
+        else:
+            stripped = re.sub(r"\\s+", " ", data).strip()
+            if stripped:
+                self.text_chunks.append(stripped)
+
+    def handle_comment(self, data: str):
+        lower = data.lower()
+        if any(token in lower for token in ("reactroot", "next_data", "__next", "nuxt")):
+            self.hydration = True
+
+    def _add_link(self, value: str) -> None:
+        try:
+            candidate = urljoin(self.base_url, value.strip())
+            parts = urlsplit(candidate)
+            if parts.scheme in {"http", "https"} and parts.netloc:
+                self.links.append(candidate)
+        except Exception:
+            pass
+
+    def _add_script(self, value: str) -> None:
+        self._add_link(value)
+
+
+class WebReconScanner:
+    _server_handler = re.compile(r"(?i)\\.(?:action|asp|aspx|cgi|do|jsp|jspx|php|pl)$")
+
+    def __init__(self, config: ScannerConfig, transport=None) -> None:
+        self.config = config
+        self.seed_url = config.seed_url
+        self.stats = ScanStats(started_at=datetime.now().astimezone().isoformat(timespec="seconds"))
+        self._transport = transport
+        self._delay_lock = threading.Lock()
+        self._last_request = 0.0
+        self._tls_retry_done: set[str] = set()
+
+    def _build_opener(self, verify_tls: bool = True):
+        if self._transport is not None:
+            return self._transport
+        handlers = [_NoRedirectHandler()]
+        if not verify_tls:
+            ctx = ssl._create_unverified_context()
+            from urllib.request import HTTPSHandler
+            handlers.append(HTTPSHandler(context=ctx))
+        return build_opener(*handlers)
+
+    def _rate_limit(self) -> None:
+        delay = self.config.request_delay
+        if delay <= 0:
+            return
+        with self._delay_lock:
+            now = time.monotonic()
+            wait = delay - (now - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request = time.monotonic()
+
+    def _fetch(self, url: str, cookie_jar: http.cookiejar.CookieJar | None = None):
+        class Response:
+            pass
+
+        self._rate_limit()
+        req = Request(
+            url,
+            headers={
+                "User-Agent": self.config.user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.2",
+                "Accept-Encoding": "identity",
+                "Connection": "close",
+            },
+            method="GET",
+        )
+        result = Response()
+        result.error = None
+        result.out_of_scope_redirect = False
+        result.status = 0
+        result.content_type = ""
+        result.final_url = url
+        result.body = b""
+        result.headers = {}
+        result.redirect_count = 0
+        opener = self._build_opener(True)
+        if cookie_jar is not None and self._transport is None:
+            from urllib.request import HTTPCookieProcessor
+            opener = self._build_opener(True)
+            opener.add_handler(HTTPCookieProcessor(cookie_jar))
+        try:
+            with opener.open(req, timeout=self.config.timeout) as resp:
+                result.status = getattr(resp, "status", resp.getcode())
+                result.final_url = resp.geturl()
+                result.content_type = (resp.headers.get_content_type() or "").lower()
+                result.headers = dict(resp.headers.items())
+                result.body = resp.read(self.config.max_response_bytes + 1)
+                result.redirect_count = 0 if result.final_url == url else 1
+                return result
+        except HTTPError as exc:
+            result.status = exc.code
+            result.final_url = exc.geturl() or url
+            result.content_type = (exc.headers.get_content_type() if exc.headers else "") or ""
+            result.content_type = result.content_type.lower()
+            result.headers = dict(exc.headers.items()) if exc.headers else {}
+            try:
+                result.body = exc.read(self.config.max_response_bytes + 1)
+            except Exception:
+                result.body = b""
+            if result.final_url != url and not self.in_scope(result.final_url):
+                result.out_of_scope_redirect = True
+            return result
+        except (ssl.SSLCertVerificationError, URLError) as exc:
+            if self.config.allow_invalid_tls and url.startswith("https://") and url not in self._tls_retry_done:
+                self._tls_retry_done.add(url)
+                self._rate_limit()
+                opener = self._build_opener(False)
+                try:
+                    with opener.open(req, timeout=self.config.timeout) as resp:
+                        result.status = getattr(resp, "status", resp.getcode())
+                        result.final_url = resp.geturl()
+                        result.content_type = (resp.headers.get_content_type() or "").lower()
+                        result.headers = dict(resp.headers.items())
+                        result.body = resp.read(self.config.max_response_bytes + 1)
+                        result.redirect_count = 0 if result.final_url == url else 1
+                        return result
+                except Exception as retry_exc:
+                    result.error = retry_exc
+                    return result
+            result.error = exc
+            return result
+        except Exception as exc:
+            result.error = exc
+            return result
+
+    def normalize_url(self, candidate: str, referrer: str | None = None) -> str | None:
+        try:
+            base = referrer or self.seed_url
+            value = urljoin(base, candidate.strip())
+            parts = urlsplit(value)
+            if parts.scheme not in {"http", "https"} or not parts.netloc:
+                return None
+            path = parts.path or "/"
+            # Fragments do not affect HTTP resources.
+            return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, ""))
+        except Exception:
+            return None
+
+    def in_scope(self, url: str) -> bool:
+        try:
+            seed = urlsplit(self.seed_url)
+            candidate = urlsplit(url)
+            if candidate.scheme not in {"http", "https"} or seed.netloc.lower() != candidate.netloc.lower():
+                return False
+            return True
+        except Exception:
+            return False
+
+    def excluded(self, url: str) -> bool:
+        path = urlsplit(url).path or "/"
+        from fnmatch import fnmatch
+        return any(fnmatch(path, pattern) for pattern in self.config.excluded_paths)
+
+    def risky(self, url: str) -> bool:
+        return bool(re.search(KATANA_RISKY_REGEX, url))
+
+    def discover_sitemap_pages(self) -> list[str]:
+        if not self.config.discover_sitemaps:
+            return []
+        discovered: list[str] = []
+        base = urlsplit(self.seed_url)
+        candidates = [
+            f"{base.scheme}://{base.netloc}/sitemap.xml",
+            f"{base.scheme}://{base.netloc}/robots.txt",
+        ]
+        seen_sitemaps: set[str] = set()
+        for source in candidates:
+            response = self._fetch(source, http.cookiejar.CookieJar())
+            if response.error or response.status >= 400:
+                continue
+            text = response.body[:self.config.max_response_bytes].decode("utf-8", "replace")
+            urls: list[str] = []
+            if source.endswith("robots.txt"):
+                for line in text.splitlines():
+                    if line.lower().startswith("sitemap:"):
+                        target = line.split(":", 1)[1].strip()
+                        if target:
+                            urls.append(target)
+            else:
+                urls.extend(re.findall(r"<loc>\\s*(https?://[^<\\s]+)", text, flags=re.I))
+            for candidate in urls:
+                normalized = self.normalize_url(candidate)
+                if not normalized or not self.in_scope(normalized) or normalized in seen_sitemaps:
+                    continue
+                seen_sitemaps.add(normalized)
+                if "sitemap" in normalized.lower() and normalized not in discovered:
+                    # A sitemap URL may itself be a sitemap. Fetch it as XML and extract loc entries.
+                    nested = self._fetch(normalized, http.cookiejar.CookieJar())
+                    if not nested.error and nested.status < 400:
+                        body = nested.body[:self.config.max_response_bytes].decode("utf-8", "replace")
+                        extracted = re.findall(r"<loc>\\s*(https?://[^<\\s]+)", body, flags=re.I)
+                        for item in extracted:
+                            page = self.normalize_url(item)
+                            if page and self.in_scope(page) and not self.risky(page):
+                                discovered.append(page)
+                        continue
+                if not self.risky(normalized):
+                    discovered.append(normalized)
+        self.stats.sitemap_pages_discovered += len(discovered)
+        return list(dict.fromkeys(discovered))
+
+    def _fingerprint(self, body: bytes) -> str:
+        import hashlib
+        return hashlib.sha256(body).hexdigest()[:16] if body else ""
+
+    def analyze_page(self, url: str, depth: int, source: str, referrer: str | None) -> PageResult:
+        response = self._fetch(url, http.cookiejar.CookieJar())
+        if response.error:
+            return PageResult(url, response.final_url, depth, source, referrer, 0, "", "inconclusive", "low", ["transport_error"], [type(response.error).__name__], [], response.redirect_count, "")
+        body = response.body
+        limitations: list[str] = []
+        if len(body) > self.config.max_response_bytes:
+            limitations.append("body_truncated")
+            body = body[:self.config.max_response_bytes]
+        content_type = response.content_type
+        decoded = body.decode("utf-8", "replace")
+        sniffed_html = bool(re.match(r"\\s*(?:<!doctype\\s+html|<html(?:\\s|>)|<head(?:\\s|>)|<body(?:\\s|>))", decoded, flags=re.I))
+        if content_type not in HTML_CONTENT_TYPES and not sniffed_html:
+            return PageResult(url, response.final_url, depth, source, referrer, response.status, content_type, "non-page", "high", ["non_html_content"], limitations, [], response.redirect_count, self._fingerprint(body))
+
+        parser = _PageParser(response.final_url)
+        try:
+            parser.feed(decoded)
+            parser.close()
+        except Exception as exc:
+            limitations.append(f"html_parse_{type(exc).__name__.lower()}")
+
+        lower = decoded.lower()
+        reasons: list[str] = []
+        text_len = len(" ".join(parser.text_chunks))
+        if text_len >= 80 or len(body) >= 1500:
+            reasons.append("substantive_html")
+        if parser.hydration or any(token in lower for token in ("__next_data__", "__next_f.push", "window.__nuxt__", "data-reactroot")):
+            reasons.append("hydration_marker")
+        if re.search(r"/(?:login|signin|sign-in|authenticate|auth)(?:[/?.#]|$)", url, re.I):
+            reasons.append("authentication_route")
+        if parser.password_inputs:
+            reasons.append("password_input_present")
+        if parser.forms:
+            reasons.append("form_present")
+        if parser.post_forms:
+            reasons.append("post_form_present")
+        if parser.submit_controls:
+            reasons.append("submit_control_present")
+
+        script_candidates = parser.scripts[: self.config.max_scripts]
+        if len(parser.scripts) > self.config.max_scripts:
+            limitations.append("script_limit_reached")
+        script_texts = list(parser.inline_scripts)
+        scripts_checked = len(script_texts)
+        self.stats.scripts_checked += scripts_checked
+        for script_url in script_candidates:
+            script = self._fetch(script_url, http.cookiejar.CookieJar())
+            if script.error:
+                limitations.append("script_fetch_failed")
+                continue
+            payload = script.body
+            if len(payload) > self.config.max_script_bytes:
+                limitations.append("script_truncated")
+                payload = payload[: self.config.max_script_bytes]
+            script_texts.append(payload.decode("utf-8", "replace"))
+            scripts_checked += 1
+            self.stats.scripts_checked += 1
+        joined_scripts = "\n".join(script_texts).lower()
+        if re.search(r"\bfetch\s*\(", joined_scripts):
+            reasons.append("fetch_call")
+        if re.search(r"\bxmlhttprequest\b|\.xhr\b", joined_scripts):
+            reasons.append("xhr")
+        if re.search(r"graphql|/graphql(?:[/?#]|$)", joined_scripts + "\n" + lower):
+            reasons.append("graphql_reference")
+        if re.search(r"eventsource\b|text/event-stream", joined_scripts + "\n" + lower):
+            reasons.append("event_stream")
+        if re.search(r"websocket\b|new\s+websocket", joined_scripts):
+            reasons.append("websocket")
+
+        if response.redirect_count and not self.in_scope(response.final_url):
+            limitations.append("out_of_scope_redirect")
+        if response.redirect_count:
+            reasons.append("redirect_observed")
+
+        dynamic_signals = bool(set(reasons) & {
+            "authentication_route", "password_input_present", "post_form_present", "submit_control_present",
+            "fetch_call", "xhr", "graphql_reference", "event_stream", "websocket",
+        })
+        substantive = "substantive_html" in reasons
+        hydration = "hydration_marker" in reasons
+        server_handler = bool(self._server_handler.search(urlsplit(response.final_url).path))
+
+        if "body_truncated" in limitations or "script_truncated" in limitations or "script_limit_reached" in limitations:
+            classification, confidence = "inconclusive", "low"
+        elif substantive and hydration:
+            classification, confidence = "hybrid", "high"
+        elif server_handler or dynamic_signals:
+            classification, confidence = "likely-server-dynamic", "medium"
+        elif substantive:
+            classification, confidence = "likely-static", "high"
+        else:
+            classification, confidence = "inconclusive", "low"
+
+        return PageResult(
+            url=url,
+            final_url=response.final_url,
+            depth=depth,
+            discovered_by=source,
+            referrer=referrer,
+            status=response.status,
+            content_type=content_type,
+            classification=classification,
+            confidence=confidence,
+            reason_codes=sorted(set(reasons)),
+            limitations=sorted(set(limitations)),
+            links=list(dict.fromkeys(parser.links)),
+            redirect_count=response.redirect_count,
+            content_fingerprint=self._fingerprint(body),
+        )
+
 
 
 VERSION = "1.0.0"
@@ -491,6 +951,9 @@ class BadOmenScanner(WebReconScanner):
                             confidence="low",
                             reason_codes=[f"analysis_exception_{type(exc).__name__.lower()}"],
                             limitations=["page_analysis_failed"],
+                            links=[],
+                            redirect_count=0,
+                            content_fingerprint="",
                         )
                     self.examined_results.append(result)
                     if result.classification != "non-page":
